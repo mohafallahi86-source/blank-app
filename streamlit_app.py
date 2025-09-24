@@ -1,8 +1,7 @@
 import streamlit as st
 
 st.title("🎈 My new app")
-st.write(
-    "import pandas as pd
+st.write("""import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import warnings
@@ -19,5 +18,5 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)"
+logger = logging.getLogger(__name__)"""
 )
