@@ -1,0 +1,203 @@
+# Feature Engineering Configuration for SME Credit Acceptance Model
+
+# Base Financial Ratios from Vendor (43 features per year)
+base_features:
+  liquidity:
+    - current_ratio
+    - quick_ratio
+    - cash_ratio
+    - working_capital
+    - working_capital_to_assets
+  
+  leverage:
+    - debt_to_equity
+    - total_debt_ratio
+    - equity_ratio
+    - debt_to_assets
+    - interest_coverage
+    - debt_service_coverage
+  
+  profitability:
+    - roe  # Return on Equity
+    - roa  # Return on Assets
+    - ros  # Return on Sales
+    - ebitda_margin
+    - net_profit_margin
+    - gross_margin
+    - operating_margin
+  
+  efficiency:
+    - asset_turnover
+    - inventory_turnover
+    - receivables_turnover
+    - payables_period
+    - days_sales_outstanding
+    - cash_conversion_cycle
+  
+  growth:
+    - revenue_growth
+    - asset_growth
+    - profit_growth
+    - equity_growth
+  
+  other:
+    - company_age
+    - industry_code
+    - plz_code
+    - schufa_score
+
+# Year-over-Year Derived Features
+yoy_features:
+  absolute_changes:
+    - revenue_change
+    - profit_change
+    - ebitda_change
+    - total_assets_change
+    - total_debt_change
+    - equity_change
+    - working_capital_change
+  
+  relative_changes:
+    - revenue_growth_rate
+    - profit_growth_rate
+    - asset_growth_rate
+    - debt_growth_rate
+    - equity_growth_rate
+  
+  ratio_changes:
+    - current_ratio_change
+    - debt_to_equity_change
+    - roe_change
+    - roa_change
+    - profit_margin_change
+  
+  trend_indicators:
+    - profitability_trend  # -1, 0, 1
+    - liquidity_trend
+    - leverage_trend
+    - revenue_trend
+
+# Time-Based Features
+time_features:
+  lag_features:
+    - application_to_financial_lag_days
+    - financial_data_age_days
+    - application_to_financial_lag_months
+  
+  seasonality:
+    - financial_statement_quarter
+    - financial_statement_month
+    - application_quarter
+    - application_month
+  
+  consistency:
+    - reporting_gap_consistency  # std of reporting intervals
+
+# Composite Risk Indicators
+composite_features:
+  financial_health:
+    - altman_z_score
+    - financial_distress_score
+    - liquidity_index
+    - leverage_index
+    - profitability_index
+  
+  stability:
+    - earnings_volatility
+    - revenue_volatility
+    - financial_stability_score
+  
+  momentum:
+    - growth_momentum_score
+    - improvement_score
+
+# Missing Value Handling
+missing_value_strategy:
+  # Strategy per feature type
+  financial_ratios:
+    method: "median"  # median, mean, forward_fill, or specific_value
+    flag_missing: true  # Create is_missing indicator
+  
+  growth_features:
+    method: "zero"  # Assume no growth if missing
+    flag_missing: true
+  
+  categorical:
+    method: "mode"
+    add_unknown_category: true
+  
+  time_features:
+    method: "forward_fill"
+    flag_missing: false
+
+# Outlier Handling
+outlier_strategy:
+  method: "winsorization"  # winsorization, capping, or removal
+  percentile_lower: 1
+  percentile_upper: 99
+  exclude_features:  # Features to exclude from outlier treatment
+    - company_age
+    - schufa_score
+
+# Feature Selection Parameters
+feature_selection:
+  univariate:
+    iv_threshold: 0.02  # Information Value threshold
+    missing_threshold: 0.5  # Max 50% missing values
+    psi_threshold: 0.25  # Population Stability Index threshold
+  
+  multivariate:
+    correlation_threshold: 0.8  # Remove highly correlated features
+    vif_threshold: 10  # Variance Inflation Factor threshold
+  
+  final_selection:
+    max_features_conventional: 10  # For logistic regression
+    max_features_advanced: 40  # For ML models
+
+# Feature Engineering Pipeline Steps
+pipeline:
+  steps:
+    - step: "load_data"
+      description: "Load cleaned application and portfolio data"
+    
+    - step: "extract_base_features"
+      description: "Extract base financial ratios from vendor data"
+    
+    - step: "calculate_yoy"
+      description: "Calculate year-over-year changes (2 rows -> derived features)"
+    
+    - step: "create_time_features"
+      description: "Calculate time-based features"
+    
+    - step: "create_composite"
+      description: "Create composite risk indicators"
+    
+    - step: "handle_missing"
+      description: "Apply missing value strategy"
+    
+    - step: "handle_outliers"
+      description: "Apply outlier treatment"
+    
+    - step: "aggregate_to_single_row"
+      description: "Combine into single row per application"
+    
+    - step: "validate_features"
+      description: "Validate feature quality and completeness"
+
+# Output Configuration
+output:
+  save_intermediate: true
+  save_format: "parquet"  # parquet, csv, or pickle
+  feature_documentation: true  # Generate feature dictionary
+  
+paths:
+  input_application: "data/processed/cleaned_applications.parquet"
+  input_portfolio: "data/processed/cleaned_portfolio.parquet"
+  output_features: "data/features/engineered_features.parquet"
+  output_metadata: "data/features/feature_metadata.json"
+
+# Logging
+logging:
+  level: "INFO"
+  log_file: "logs/feature_engineering.log"
+  log_statistics: true
