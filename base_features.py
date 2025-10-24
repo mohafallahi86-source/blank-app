@@ -1,335 +1,174 @@
-"""
-Base Features Module
-Extracts and validates base financial features from vendor-processed application data
-"""
-
-import pandas as pd
 import numpy as np
-import logging
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import yaml
+import pandas as pd
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Column 289 - Quote der flüssigen Mittel (%).1
+if set(['Liquide Mittel', 'bereinigte Bilanzsumme Aktiva']).issubset(df.columns):
+    df['quote_fluessige_mittel'] = (df['Liquide Mittel'] / df['bereinigte Bilanzsumme Aktiva']) * 100
 
+# Column 293 - Kundenziel (Tage).1 (Days Sales Outstanding)
+if set(['Forderungen aus Lieferungen und Leistungen RLZ bis 1 Jahr', 'Umsatzerlöse']).issubset(df.columns):
+    # Note: Has scaling issues - for large companies (Bilanzsumme > 100), multiply Umsatz by 1000
+    scale_factor = np.where(df['bereinigte Bilanzsumme Aktiva'] > 100, 1000, 1)
+    df['kundenziel_tage'] = (df['Forderungen aus Lieferungen und Leistungen RLZ bis 1 Jahr'] / (df['Umsatzerlöse'] * scale_factor)) * 365
 
-class BaseFeatureExtractor:
-    """
-    Extracts base financial features from vendor-processed application data
-    Each application has 2 rows (2 years of financial data)
-    """
-    
-    def __init__(self, config_path: Optional[str] = None):
-        if config_path:
-            with open(config_path, 'r') as f:
-                self.config = yaml.safe_load(f)
-        else:
-            self.config = self._get_default_config()
-        
-        self.base_feature_list = self._get_base_feature_list()
-        self.feature_metadata = {}
-    
-    def _get_default_config(self) -> Dict:
-        """Default configuration if no config file provided"""
-        return {
-            'base_features': {
-                'liquidity': ['current_ratio', 'quick_ratio', 'cash_ratio', 'working_capital'],
-                'leverage': ['debt_to_equity', 'equity_ratio', 'debt_to_assets'],
-                'profitability': ['roe', 'roa', 'ros', 'net_profit_margin'],
-                'efficiency': ['asset_turnover', 'inventory_turnover'],
-                'growth': ['revenue_growth', 'asset_growth'],
-                'other': ['company_age', 'industry_code', 'plz_code', 'schufa_score']
-            }
-        }
-    
-    def _get_base_feature_list(self) -> List[str]:
-        """Flatten base features from config"""
-        features = []
-        for category, feature_list in self.config['base_features'].items():
-            features.extend(feature_list)
-        return features
-    
-    def extract_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Extract base features from application dataframe
-        
-        Args:
-            df: Application dataframe with 2 rows per companyID
-            
-        Returns:
-            DataFrame with extracted and validated features
-        """
-        logger.info("Starting base feature extraction")
-        logger.info(f"Input data: {len(df)} rows, {len(df.columns)} columns")
-        
-        # Validate input data structure
-        self._validate_input_data(df)
-        
-        # Sort by companyID and year (newest first)
-        df_sorted = self._sort_by_company_and_year(df)
-        
-        # Extract features for each year
-        df_with_year_suffix = self._add_year_suffixes(df_sorted)
-        
-        # Log extraction statistics
-        self._log_extraction_stats(df_with_year_suffix)
-        
-        logger.info("Base feature extraction completed")
-        
-        return df_with_year_suffix
-    
-    def _validate_input_data(self, df: pd.DataFrame) -> None:
-        """Validate input data structure"""
-        logger.info("Validating input data structure")
-        
-        if 'companyID' not in df.columns:
-            raise ValueError("companyID column not found in dataframe")
-        
-        # Check for required date columns
-        date_columns = ['application_date', 'financial_statement_date', 'year']
-        available_date_cols = [col for col in date_columns if col in df.columns]
-        
-        if not available_date_cols:
-            logger.warning("No date columns found. Cannot verify temporal ordering.")
-        
-        # Check number of rows per company
-        rows_per_company = df.groupby('companyID').size()
-        logger.info(f"Rows per company distribution:\n{rows_per_company.value_counts().head()}")
-        
-        companies_with_2_rows = (rows_per_company == 2).sum()
-        total_companies = df['companyID'].nunique()
-        pct = companies_with_2_rows / total_companies * 100
-        
-        logger.info(f"Companies with exactly 2 rows: {companies_with_2_rows} ({pct:.2f}%)")
-        
-        if pct < 80:
-            logger.warning(f"Only {pct:.2f}% of companies have 2 rows of financial data")
-    
-    def _sort_by_company_and_year(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Sort data by companyID and financial year (newest first)"""
-        logger.info("Sorting data by company and year")
-        
-        if 'financial_statement_date' in df.columns:
-            df['financial_statement_date'] = pd.to_datetime(df['financial_statement_date'])
-            df_sorted = df.sort_values(
-                ['companyID', 'financial_statement_date'], 
-                ascending=[True, False]
-            )
-        elif 'year' in df.columns:
-            df_sorted = df.sort_values(
-                ['companyID', 'year'], 
-                ascending=[True, False]
-            )
-        else:
-            logger.warning("No year/date column found. Using original order.")
-            df_sorted = df.sort_values('companyID')
-        
-        return df_sorted
-    
-    def _add_year_suffixes(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Add year suffixes to features (_t0 for most recent, _t1 for previous year)
-        Keep both rows for now (will aggregate later)
-        
-        Args:
-            df: Sorted dataframe
-            
-        Returns:
-            DataFrame with year suffixes
-        """
-        logger.info("Adding year suffixes to features")
-        
-        # Add row number within each company group
-        df['year_rank'] = df.groupby('companyID').cumcount()
-        
-        # Create year indicator (0 = most recent, 1 = previous year)
-        df['year_indicator'] = df['year_rank'].map({0: 't0', 1: 't1'})
-        
-        # Identify numeric financial columns (exclude ID, date, categorical columns)
-        exclude_cols = ['companyID', 'application_date', 'financial_statement_date', 
-                       'year', 'year_rank', 'year_indicator', 'industry_code', 'plz_code']
-        
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        feature_cols = [col for col in numeric_cols if col not in exclude_cols]
-        
-        logger.info(f"Identified {len(feature_cols)} numeric feature columns")
-        
-        # Store metadata about available features
-        self.feature_metadata['available_features'] = feature_cols
-        self.feature_metadata['missing_features'] = [
-            f for f in self.base_feature_list if f not in feature_cols
-        ]
-        
-        if self.feature_metadata['missing_features']:
-            logger.warning(
-                f"Missing expected features: {self.feature_metadata['missing_features'][:10]}"
-            )
-        
-        return df
-    
-    def _log_extraction_stats(self, df: pd.DataFrame) -> None:
-        """Log statistics about extracted features"""
-        logger.info("\n" + "=" * 80)
-        logger.info("BASE FEATURE EXTRACTION STATISTICS")
-        logger.info("=" * 80)
-        
-        logger.info(f"\nTotal rows: {len(df):,}")
-        logger.info(f"Unique companies: {df['companyID'].nunique():,}")
-        
-        if 'year_indicator' in df.columns:
-            logger.info(f"\nYear distribution:\n{df['year_indicator'].value_counts()}")
-        
-        # Check for available feature categories
-        for category, features in self.config['base_features'].items():
-            available = [f for f in features if f in df.columns]
-            pct = len(available) / len(features) * 100 if features else 0
-            logger.info(f"\n{category.upper()}: {len(available)}/{len(features)} features ({pct:.1f}%)")
-            
-            if len(available) < len(features):
-                missing = [f for f in features if f not in df.columns]
-                logger.warning(f"  Missing: {missing}")
-        
-        # Missing value statistics for key features
-        logger.info("\nMissing value percentages for key features:")
-        key_features = ['current_ratio', 'debt_to_equity', 'roe', 'roa', 
-                       'revenue_growth', 'schufa_score']
-        
-        for feature in key_features:
-            if feature in df.columns:
-                missing_pct = df[feature].isnull().sum() / len(df) * 100
-                logger.info(f"  {feature}: {missing_pct:.2f}%")
-        
-        logger.info("=" * 80)
-    
-    def get_feature_summary(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Generate summary statistics for all base features
-        
-        Args:
-            df: DataFrame with features
-            
-        Returns:
-            Summary DataFrame with statistics
-        """
-        logger.info("Generating feature summary statistics")
-        
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        exclude_cols = ['companyID', 'year_rank']
-        feature_cols = [col for col in numeric_cols if col not in exclude_cols]
-        
-        summary_stats = []
-        
-        for col in feature_cols:
-            stats = {
-                'feature': col,
-                'count': df[col].count(),
-                'missing': df[col].isnull().sum(),
-                'missing_pct': df[col].isnull().sum() / len(df) * 100,
-                'mean': df[col].mean(),
-                'std': df[col].std(),
-                'min': df[col].min(),
-                'p25': df[col].quantile(0.25),
-                'median': df[col].median(),
-                'p75': df[col].quantile(0.75),
-                'max': df[col].max(),
-                'nunique': df[col].nunique()
-            }
-            summary_stats.append(stats)
-        
-        summary_df = pd.DataFrame(summary_stats)
-        
-        return summary_df
-    
-    def validate_features(self, df: pd.DataFrame) -> Dict[str, any]:
-        """
-        Validate feature quality
-        
-        Args:
-            df: DataFrame with features
-            
-        Returns:
-            Dictionary with validation results
-        """
-        logger.info("Validating feature quality")
-        
-        validation_results = {
-            'total_features': 0,
-            'high_missing': [],
-            'zero_variance': [],
-            'extreme_outliers': []
-        }
-        
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        exclude_cols = ['companyID', 'year_rank']
-        feature_cols = [col for col in numeric_cols if col not in exclude_cols]
-        
-        validation_results['total_features'] = len(feature_cols)
-        
-        for col in feature_cols:
-            # Check missing values
-            missing_pct = df[col].isnull().sum() / len(df) * 100
-            if missing_pct > 50:
-                validation_results['high_missing'].append((col, missing_pct))
-            
-            # Check variance
-            if df[col].std() == 0:
-                validation_results['zero_variance'].append(col)
-            
-            # Check extreme outliers (beyond 99.9th percentile by large margin)
-            if not df[col].isnull().all():
-                p999 = df[col].quantile(0.999)
-                max_val = df[col].max()
-                if max_val > p999 * 10:  # Max is 10x the 99.9th percentile
-                    validation_results['extreme_outliers'].append((col, max_val, p999))
-        
-        # Log validation results
-        logger.info(f"\nValidation Results:")
-        logger.info(f"  Total features validated: {validation_results['total_features']}")
-        logger.info(f"  Features with >50% missing: {len(validation_results['high_missing'])}")
-        logger.info(f"  Zero variance features: {len(validation_results['zero_variance'])}")
-        logger.info(f"  Features with extreme outliers: {len(validation_results['extreme_outliers'])}")
-        
-        return validation_results
+# Column 297 - Eigenkapitalquote (%).1 (Equity Ratio)
+if set(['bereinigtes Eigenkapital', 'bereinigte Bilanzsumme Aktiva']).issubset(df.columns):
+    df['eigenkapitalquote'] = (df['bereinigtes Eigenkapital'] / df['bereinigte Bilanzsumme Aktiva']) * 100
 
+# Column 301 - Verschuldungsgrad.1 (Debt-to-Equity Ratio)
+if set(['Summe Verbindlichkeiten', 'bereinigtes Eigenkapital']).issubset(df.columns):
+    df['verschuldungsgrad'] = (df['Summe Verbindlichkeiten'] / df['bereinigtes Eigenkapital']) * 100
 
-def main():
-    """Example usage"""
-    from pathlib import Path
-    
-    # Initialize extractor
-    config_path = Path("config/feature_config.yaml")
-    if config_path.exists():
-        extractor = BaseFeatureExtractor(str(config_path))
-    else:
-        logger.warning("Config file not found, using defaults")
-        extractor = BaseFeatureExtractor()
-    
-    # Load cleaned application data
-    input_path = Path("data/processed/cleaned_applications.parquet")
-    if not input_path.exists():
-        logger.error(f"Input file not found: {input_path}")
-        return
-    
-    df = pd.read_parquet(input_path)
-    
-    # Extract base features
-    df_features = extractor.extract_features(df)
-    
-    # Generate summary
-    summary = extractor.get_feature_summary(df_features)
-    print("\nFeature Summary:")
-    print(summary.head(20))
-    
-    # Validate features
-    validation = extractor.validate_features(df_features)
-    
-    # Save extracted features
-    output_path = Path("data/features/base_features.parquet")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    df_features.to_parquet(output_path, index=False)
-    logger.info(f"Saved base features to {output_path}")
+# Column 305 - Kurzfristige Fremdkapitalquote (%).1
+if set(['kurzfristiges Fremdkapital', 'bereinigte Bilanzsumme Aktiva']).issubset(df.columns):
+    df['kurzfr_fk_quote'] = (df['kurzfristiges Fremdkapital'] / df['bereinigte Bilanzsumme Aktiva']) * 100
 
+# Column 309 - Langfristige Fremdkapitalquote (%).1
+if set(['langfristiges Fremdkapital', 'bereinigte Bilanzsumme Aktiva']).issubset(df.columns):
+    df['langfr_fk_quote'] = (df['langfristiges Fremdkapital'] / df['bereinigte Bilanzsumme Aktiva']) * 100
 
-if __name__ == "__main__":
-    main()
+# Column 313 - kurzfristige Kapitalbindung (%).1
+if set(['Umlaufvermögen', 'bereinigte Bilanzsumme Aktiva']).issubset(df.columns):
+    df['kurzfr_kapitalbindung'] = (df['Umlaufvermögen'] / df['bereinigte Bilanzsumme Aktiva']) * 100
+
+# Column 317 - Kapitalbindungsdauer (Tage).1
+if set(['Umlaufvermögen', 'Umsatzerlöse']).issubset(df.columns):
+    scale_factor = np.where(df['bereinigte Bilanzsumme Aktiva'] > 100, 1000, 1)
+    df['kapitalbindungsdauer'] = (df['Umlaufvermögen'] / (df['Umsatzerlöse'] * scale_factor)) * 365
+
+# Column 321 - Fremdkapitalstruktur (%).1
+if set(['kurzfristiges Fremdkapital', 'Summe Verbindlichkeiten']).issubset(df.columns):
+    df['fk_struktur'] = (df['kurzfristiges Fremdkapital'] / df['Summe Verbindlichkeiten']) * 100
+
+# Column 325 - Quote Verbindl. aus Lieferungen und Leistungen mod.(%).1
+if set(['Verbindlichkeiten aus Lieferungen und Leistungen RLZ bis 1 Jahr', 'kurzfristiges Fremdkapital']).issubset(df.columns):
+    df['lieferanten_verb_quote'] = (df['Verbindlichkeiten aus Lieferungen und Leistungen RLZ bis 1 Jahr'] / df['kurzfristiges Fremdkapital']) * 100
+
+# Column 329 - Lieferantenziel (Tage).1 (Days Payable Outstanding)
+if set(['Verbindlichkeiten aus Lieferungen und Leistungen RLZ bis 1 Jahr', 'Aufwand für Roh-, Hilfs- und Betriebsstoffe', 'Aufwand für bezogene Leistungen']).issubset(df.columns):
+    material_costs = df['Aufwand für Roh-, Hilfs- und Betriebsstoffe'] + df['Aufwand für bezogene Leistungen']
+    scale_factor = np.where(df['bereinigte Bilanzsumme Aktiva'] > 100, 1000, 1)
+    df['lieferantenziel'] = (df['Verbindlichkeiten aus Lieferungen und Leistungen RLZ bis 1 Jahr'] / (material_costs * scale_factor)) * 365
+
+# Column 333 - Cash Flow (absolut).1
+if set(['Betriebsergebnis', 'Abschreibungen inkl. Firmenabschreibung']).issubset(df.columns):
+    df['cash_flow'] = df['Betriebsergebnis'] + df['Abschreibungen inkl. Firmenabschreibung']
+
+# Column 337 - Cash Flow zur Gesamtleistung (%).1
+if set(['Betriebsergebnis', 'Abschreibungen inkl. Firmenabschreibung', 'Gesamtleistung']).issubset(df.columns):
+    cash_flow = df['Betriebsergebnis'] + df['Abschreibungen inkl. Firmenabschreibung']
+    df['cf_zu_gesamtleistung'] = (cash_flow / df['Gesamtleistung']) * 100
+
+# Column 341 - Cash Flow zur Effektivverschuldung (%).1
+if set(['Betriebsergebnis', 'Abschreibungen inkl. Firmenabschreibung', 'Summe Verbindlichkeiten', 'Liquide Mittel']).issubset(df.columns):
+    cash_flow = df['Betriebsergebnis'] + df['Abschreibungen inkl. Firmenabschreibung']
+    effektiv_verschuldung = df['Summe Verbindlichkeiten'] - df['Liquide Mittel']
+    df['cf_zu_effektivverschuldung'] = (cash_flow / effektiv_verschuldung) * 100
+
+# Column 345 - Cash Flow ROI (%).1
+if set(['Betriebsergebnis', 'Abschreibungen inkl. Firmenabschreibung', 'bereinigte Bilanzsumme Aktiva']).issubset(df.columns):
+    cash_flow = df['Betriebsergebnis'] + df['Abschreibungen inkl. Firmenabschreibung']
+    df['cash_flow_roi'] = (cash_flow / df['bereinigte Bilanzsumme Aktiva']) * 100
+
+# Column 349 - Dynamische Entschuldungsdauer (Jahre).1
+if set(['Summe Verbindlichkeiten', 'Liquide Mittel', 'Betriebsergebnis', 'Abschreibungen inkl. Firmenabschreibung']).issubset(df.columns):
+    effektiv_verschuldung = df['Summe Verbindlichkeiten'] - df['Liquide Mittel']
+    cash_flow = df['Betriebsergebnis'] + df['Abschreibungen inkl. Firmenabschreibung']
+    df['dynamische_entschuldungsdauer'] = effektiv_verschuldung / cash_flow
+    df['dynamische_entschuldungsdauer'] = df['dynamische_entschuldungsdauer'].replace([np.inf, -np.inf], np.nan)
+
+# Column 353 - Schuldendienstfähigkeit (%).1
+if set(['Betriebsergebnis', 'Abschreibungen inkl. Firmenabschreibung', 'Finanzergebnis']).issubset(df.columns):
+    cash_flow = df['Betriebsergebnis'] + df['Abschreibungen inkl. Firmenabschreibung']
+    df['schuldendienstfaehigkeit'] = (cash_flow / abs(df['Finanzergebnis'])) * 100
+    df['schuldendienstfaehigkeit'] = df['schuldendienstfaehigkeit'].replace([np.inf, -np.inf], np.nan)
+
+# Column 357 - Return on Investment (%).1
+if set(['Betriebsergebnis', 'Finanzergebnis', 'bereinigte Bilanzsumme Aktiva']).issubset(df.columns):
+    df['roi'] = ((df['Betriebsergebnis'] + df['Finanzergebnis']) / df['bereinigte Bilanzsumme Aktiva']) * 100
+
+# Column 361 - Eigenkapitalrentabilität (%).1
+if set(['Jahresergebnis', 'bereinigtes Eigenkapital']).issubset(df.columns):
+    df['eigenkapitalrentabilitaet'] = (df['Jahresergebnis'] / df['bereinigtes Eigenkapital']) * 100
+    df['eigenkapitalrentabilitaet'] = df['eigenkapitalrentabilitaet'].replace([np.inf, -np.inf], np.nan)
+
+# Column 365 - Gesamtkapitalrentabilität (%).1
+if set(['Betriebsergebnis', 'Finanzergebnis', 'bereinigte Bilanzsumme Aktiva']).issubset(df.columns):
+    df['gesamtkapitalrentabilitaet'] = ((df['Betriebsergebnis'] + abs(df['Finanzergebnis'])) / df['bereinigte Bilanzsumme Aktiva']) * 100
+
+# Column 369 - Umsatzrentabilität (%).1 (Profit Margin)
+if set(['Betriebsergebnis', 'Umsatzerlöse']).issubset(df.columns):
+    scale_factor = np.where(df['bereinigte Bilanzsumme Aktiva'] > 100, 1000, 1)
+    df['umsatzrentabilitaet'] = (df['Betriebsergebnis'] / (df['Umsatzerlöse'] * scale_factor)) * 100
+
+# Column 373 - Rohertragsquote (%).1 (Gross Margin)
+if set(['Rohertrag', 'Gesamtleistung']).issubset(df.columns):
+    df['rohertragsquote'] = (df['Rohertrag'] / df['Gesamtleistung']) * 100
+
+# Column 377 - EBIT zum Zinsaufwand.1 (Interest Coverage Ratio)
+if set(['Betriebsergebnis', 'Finanzergebnis']).issubset(df.columns):
+    df['ebit_zu_zinsaufwand'] = df['Betriebsergebnis'] / abs(df['Finanzergebnis'])
+    df['ebit_zu_zinsaufwand'] = df['ebit_zu_zinsaufwand'].replace([np.inf, -np.inf], np.nan)
+
+# Column 381 - EBITDA zum Zinsaufwand.1
+if set(['Betriebsergebnis', 'Abschreibungen inkl. Firmenabschreibung', 'Finanzergebnis']).issubset(df.columns):
+    ebitda = df['Betriebsergebnis'] + df['Abschreibungen inkl. Firmenabschreibung']
+    df['ebitda_zu_zinsaufwand'] = ebitda / abs(df['Finanzergebnis'])
+    df['ebitda_zu_zinsaufwand'] = df['ebitda_zu_zinsaufwand'].replace([np.inf, -np.inf], np.nan)
+
+# Column 385 - Personalaufwandsquote (%).1
+if set(['Löhne und Gehälter', 'soziale Abgaben, Altersversorgung', 'Gesamtleistung']).issubset(df.columns):
+    personalaufwand = df['Löhne und Gehälter'] + df['soziale Abgaben, Altersversorgung']
+    scale_factor = np.where(df['bereinigte Bilanzsumme Aktiva'] > 100, 1000, 1)
+    df['personalaufwandsquote'] = (personalaufwand / (df['Gesamtleistung'] * scale_factor)) * 100
+
+# Column 389 - Materialaufwandsquote (%).1
+if set(['Aufwand für Roh-, Hilfs- und Betriebsstoffe', 'Aufwand für bezogene Leistungen', 'Gesamtleistung']).issubset(df.columns):
+    materialaufwand = df['Aufwand für Roh-, Hilfs- und Betriebsstoffe'] + df['Aufwand für bezogene Leistungen']
+    scale_factor = np.where(df['bereinigte Bilanzsumme Aktiva'] > 100, 1000, 1)
+    df['materialaufwandsquote'] = (materialaufwand / (df['Gesamtleistung'] * scale_factor)) * 100
+
+# Column 393 - Aufwand-Ertrag-Verhältnis.1
+if set(['Gesamtleistung', 'sonstige betriebliche Erträge', 'Betriebsergebnis']).issubset(df.columns):
+    gesamtertrag = df['Gesamtleistung'] + df['sonstige betriebliche Erträge']
+    gesamtaufwand = gesamtertrag - df['Betriebsergebnis']
+    df['aufwand_ertrag_verhaeltnis'] = gesamtaufwand / gesamtertrag
+    df['aufwand_ertrag_verhaeltnis'] = df['aufwand_ertrag_verhaeltnis'].replace([np.inf, -np.inf], np.nan)
+
+# Column 397 - Umsatz je Mitarbeiter (absolut).1
+if 'Mitarbeiteranzahl' in df.columns and 'Umsatzerlöse' in df.columns:
+    scale_factor = np.where(df['bereinigte Bilanzsumme Aktiva'] > 100, 1000, 1)
+    df['umsatz_je_mitarbeiter'] = (df['Umsatzerlöse'] * scale_factor) / df['Mitarbeiteranzahl']
+    df['umsatz_je_mitarbeiter'] = df['umsatz_je_mitarbeiter'].replace([np.inf, -np.inf], np.nan)
+
+# Column 401 - Zinsaufwand zum Fremdkapital (%).1
+if set(['Finanzergebnis', 'Summe Verbindlichkeiten']).issubset(df.columns):
+    df['zinsaufwand_zu_fk'] = (abs(df['Finanzergebnis']) / df['Summe Verbindlichkeiten']) * 100
+
+# Column 405 - Erfolgsquote (%).1
+if set(['Jahresergebnis', 'Gesamtleistung']).issubset(df.columns):
+    df['erfolgsquote'] = (df['Jahresergebnis'] / df['Gesamtleistung']) * 100
+
+# Column 409 - Liquidität I. Grades (%).1 (Cash Ratio)
+if set(['Liquide Mittel', 'kurzfristiges Fremdkapital']).issubset(df.columns):
+    df['liquiditaet_1'] = (df['Liquide Mittel'] / df['kurzfristiges Fremdkapital']) * 100
+    df['liquiditaet_1'] = df['liquiditaet_1'].replace([np.inf, -np.inf], np.nan)
+
+# Column 413 - Liquidität II. Grades (%).1 (Quick Ratio)
+if set(['Liquide Mittel', 'Forderungen aus Lieferungen und Leistungen RLZ bis 1 Jahr', 'kurzfristiges Fremdkapital']).issubset(df.columns):
+    df['liquiditaet_2'] = ((df['Liquide Mittel'] + df['Forderungen aus Lieferungen und Leistungen RLZ bis 1 Jahr']) / df['kurzfristiges Fremdkapital']) * 100
+    df['liquiditaet_2'] = df['liquiditaet_2'].replace([np.inf, -np.inf], np.nan)
+
+# Column 417 - Liquidität III. Grades (%).1 (Current Ratio)
+if set(['Umlaufvermögen', 'kurzfristiges Fremdkapital']).issubset(df.columns):
+    df['liquiditaet_3'] = (df['Umlaufvermögen'] / df['kurzfristiges Fremdkapital']) * 100
+    df['liquiditaet_3'] = df['liquiditaet_3'].replace([np.inf, -np.inf], np.nan)
+
+# Column 421 - Net Working Capital (absolut).1
+if set(['Umlaufvermögen', 'kurzfristiges Fremdkapital']).issubset(df.columns):
+    df['net_working_capital'] = df['Umlaufvermögen'] - df['kurzfristiges Fremdkapital']
+
+# Column 425 - Liquidität I. Grades (%) erweitert.1
+if set(['Liquide Mittel', 'Wertpapiere des Umlaufvermögens', 'kurzfristiges Fremdkapital']).issubset(df.columns):
+    df['liquiditaet_1_erweitert'] = ((df['Liquide Mittel'] + df['Wertpapiere des Umlaufvermögens']) / df['kurzfristiges Fremdkapital']) * 100
+    df['liquiditaet_1_erweitert'] = df['liquiditaet_1_erweitert'].replace([np.inf, -np.inf], np.nan)
