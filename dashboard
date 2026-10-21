@@ -1,0 +1,821 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Application funnel by PD band</title>
+<!--
+  APPLICATION FUNNEL BY PD BAND
+  =============================
+  A self-contained dashboard: open this file in a browser (Chrome, Edge, Firefox),
+  choose the CSV or Excel (.xlsx) export of WORK.APPLICATIONS from SAS, and it builds
+  the monthly PD-band table plus charts. Nothing is uploaded: the file is read on your computer.
+
+  How a PD band is chosen:
+    Instant channel   → TRACR_PD_PCT
+    FastTrack channel → CRAG_PD_PCT
+    (set in CONFIG.channels; band boundaries in CONFIG.pdBandEdges)
+
+  Table columns (per PD band, for the selected month and filters):
+    Application #          a                         = number of applications
+    Application %          a / Sum(a)
+    Rejects % by KOR       KOR/KYC/Ops rejects / a
+    Rejects % by Score     score rejects / a
+    High Side Overrides %  high-side overrides / a
+    Low Side Overrides %   low-side overrides / a
+    Approved %             approved / a
+    Booked %               booked (disbursed) / approved
+
+  Where to change things:
+    1. CONFIG ............ column names, channels, PD band boundaries, flag values
+    2. FILE READING ...... CSV and Excel parsing (same code as model_monitor.html)
+    3. RECORDS ........... turning file rows into applications with a PD band
+    4. CALCULATIONS ...... the band table, outcomes, monthly trend
+    5. CHARTS ............ the SVG chart helper
+    6. PAGE RENDERING .... cards, charts and tables
+    7. STARTUP ........... file picker, filters, downloads
+-->
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --fg: #1f1f1d; --muted: #6b6a66; --line: #e3e2de;
+    --grid: #ecebe7; --accent: #2f6fdb; --accent2: #c2672a; --muted-series: #a9a8a3;
+    --c-kor: #8e5bd0; --c-score: #c0392b; --c-otherrej: #e08a7a; --c-booked: #2e7d4f; --c-approved: #8cc7a1; --c-other: #c9c8c3;
+    --l1: #2e7d4f; --l2: #8e5bd0; --l3: #c0392b; --l4: #2f6fdb;
+    --ok: #2e7d4f; --bad: #c0392b;
+    --radius: 10px;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1b1b1a; --panel: #242423; --fg: #ecebe7; --muted: #a3a29d; --line: #3a3a38;
+      --grid: #31312f; --accent: #6b9cf0; --accent2: #e08a4f; --muted-series: #6d6c68;
+      --c-kor: #a77fe0; --c-score: #ef7466; --c-otherrej: #b5675b; --c-booked: #5cc286; --c-approved: #2f6b46; --c-other: #55544f;
+      --l1: #5cc286; --l2: #a77fe0; --l3: #ef7466; --l4: #6b9cf0;
+      --ok: #5cc286; --bad: #ef7466;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--font); font-size: 14px; line-height: 1.45; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 24px 16px 48px; display: flex; flex-direction: column; gap: 18px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+  h1 { font-size: 24px; font-weight: 600; margin: 0; }
+  h2 { font-size: 15px; font-weight: 600; margin: 0; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .controls label { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); font-size: 12px; }
+  button, select, .filebtn {
+    font: inherit; font-size: 14px; color: var(--fg); background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 12px; cursor: pointer;
+  }
+  .filebtn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .filebtn input { display: none; }
+  .fileinfo { color: var(--muted); font-size: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; min-width: 0; }
+  .note { color: var(--muted); font-size: 12px; margin: 4px 0 12px; }
+  .banner { border-radius: var(--radius); padding: 12px 16px; font-size: 15px; background: var(--panel); border: 1px solid var(--line); }
+  .banner.warn { border-color: var(--accent2); }
+  .banner.bad { border-color: var(--bad); }
+  .error { color: var(--bad); font-weight: 600; }
+  #dashboard { display: flex; flex-direction: column; gap: 18px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .kpi .label { font-weight: 600; }
+  .kpi .sub { color: var(--muted); font-size: 12px; }
+  .kpi .value { font-size: 28px; font-variant-numeric: tabular-nums; margin: 6px 0 2px; }
+  .up { color: var(--ok); } .down { color: var(--bad); } .flat { color: var(--muted); }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 12px; }
+  .chart { position: relative; min-height: 220px; }
+  .chart svg { display: block; width: 100%; overflow: visible; }
+  .chart text { font-family: var(--font); font-size: 11px; fill: var(--muted); }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line);
+         border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.15); padding: 6px 10px; font-size: 12px;
+         white-space: nowrap; z-index: 5; display: none; font-variant-numeric: tabular-nums; }
+  .tip .h { color: var(--muted); margin-bottom: 2px; }
+  .tip .r { display: flex; gap: 14px; justify-content: space-between; }
+  .empty-chart { display: flex; align-items: center; justify-content: center; min-height: 180px; color: var(--muted); }
+  .tablewrap { overflow: auto; max-height: 560px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+  th { position: sticky; top: 0; background: var(--panel); font-size: 12px; color: var(--muted); font-weight: 600; vertical-align: bottom; }
+  th small { display: block; font-weight: 400; color: var(--accent); }
+  th:first-child, td:first-child { text-align: left; }
+  tr.total td { font-weight: 700; border-top: 2px solid var(--fg); border-bottom: none; }
+  td.zero { color: var(--muted); }
+  .table-title { text-align: center; font-weight: 600; background: var(--grid); border-radius: 6px; padding: 6px; margin-bottom: 6px; }
+  .mix { display: flex; flex-direction: column; gap: 6px; min-height: 220px; }
+  .mix-row { display: grid; grid-template-columns: 8.5rem 1fr 3.5rem; gap: 8px; align-items: center; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .mix-bar { display: flex; height: 16px; border-radius: 4px; overflow: hidden; background: var(--grid); }
+  .mix-bar span { display: block; height: 100%; }
+  .mix-n { text-align: right; color: var(--muted); }
+  .welcome { text-align: center; padding: 48px 16px; border: 2px dashed var(--line); border-radius: var(--radius); background: var(--panel); }
+  body.dragging .wrap { outline: 3px dashed var(--accent); outline-offset: -8px; }
+  @media (max-width: 640px) { .hide-narrow { display: none; } .mix-row { grid-template-columns: 6rem 1fr 2.5rem; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1 id="title">Application funnel by PD band</h1>
+      <div class="fileinfo" id="fileinfo">No file loaded</div>
+    </div>
+    <div class="controls">
+      <label class="filebtn primary">Choose SAS export…<input type="file" id="file" accept=".csv,.txt,.tsv,.xlsx,.xlsm,.xls,.sas7bdat"></label>
+      <span id="filters" hidden style="display:contents">
+        <label>Month <select id="f-month"></select></label>
+        <label>Channel <select id="f-channel"></select></label>
+        <label>Product <select id="f-product"></select></label>
+        <button id="download">Download table (CSV)</button>
+      </span>
+    </div>
+  </header>
+
+  <div id="message"></div>
+
+  <section class="welcome" id="welcome">
+    <h2>Choose the WORK.APPLICATIONS export (CSV or Excel .xlsx), or drop it anywhere on this page</h2>
+    <p class="note">The file stays on your computer. Column names are set in CONFIG at the top of this file.</p>
+  </section>
+
+  <main id="dashboard" hidden>
+    <div class="banner" id="banner"></div>
+
+    <section class="kpis">
+      <div class="card kpi"><div class="label">Applications</div><div class="sub" id="k-month"></div>
+        <div class="value" id="k-apps">—</div><div class="sub" id="k-apps-d"></div></div>
+      <div class="card kpi"><div class="label">Rejects by KOR</div><div class="sub">KOR/KYC/Ops rejects ÷ applications</div>
+        <div class="value" id="k-kor">—</div><div class="sub" id="k-kor-d"></div></div>
+      <div class="card kpi"><div class="label">Rejects by score</div><div class="sub">Score rejects ÷ applications</div>
+        <div class="value" id="k-score">—</div><div class="sub" id="k-score-d"></div></div>
+      <div class="card kpi"><div class="label">Approved</div><div class="sub">Approved ÷ applications</div>
+        <div class="value" id="k-appr">—</div><div class="sub" id="k-appr-d"></div></div>
+      <div class="card kpi"><div class="label">Booked</div><div class="sub">Booked (disbursed) ÷ approved</div>
+        <div class="value" id="k-book">—</div><div class="sub" id="k-book-d"></div></div>
+      <div class="card kpi"><div class="label">Overrides</div><div class="sub">High + low side ÷ applications</div>
+        <div class="value" id="k-ovr">—</div><div class="sub" id="k-ovr-d"></div></div>
+    </section>
+
+    <section class="card" id="band-table-card">
+      <div class="table-title" id="table-title"></div>
+      <p class="note" id="table-note"></p>
+      <div class="tablewrap"><table id="t-bands"></table></div>
+    </section>
+
+    <section class="grid2">
+      <div class="card">
+        <h2>Outcome by PD band</h2>
+        <p class="note">Each application counted once: approved first (booked or not), then KOR reject, score reject, other reject, and finally withdrawn or pending.</p>
+        <div class="legend">
+          <span><i style="background:var(--c-booked)"></i>Booked</span><span><i style="background:var(--c-approved)"></i>Approved, not booked</span>
+          <span><i style="background:var(--c-kor)"></i>KOR reject</span><span><i style="background:var(--c-score)"></i>Score reject</span>
+          <span><i style="background:var(--c-otherrej)"></i>Other reject</span><span><i style="background:var(--c-other)"></i>Withdrawn / pending</span>
+        </div>
+        <div class="mix" id="c-mix"></div>
+      </div>
+      <div class="card">
+        <h2>Applications by month</h2>
+        <p class="note">For the selected channel and product. Click a bar to select that month.</p>
+        <div class="chart" id="c-apps"></div>
+      </div>
+      <div class="card">
+        <h2>Rates by month</h2>
+        <p class="note">Approved, KOR and score rejects as a share of applications; booked as a share of approved.</p>
+        <div class="legend">
+          <span><i style="background:var(--l1)"></i>Approved %</span><span><i style="background:var(--l2)"></i>KOR rejects %</span>
+          <span><i style="background:var(--l3)"></i>Score rejects %</span><span><i style="background:var(--l4)"></i>Booked %</span>
+        </div>
+        <div class="chart" id="c-rates"></div>
+      </div>
+      <div class="card">
+        <h2>Rejection categories</h2>
+        <p class="note" id="rej-note">Rejected applications in the selected month, by REJECTION_CATEGORY.</p>
+        <div class="tablewrap"><table id="t-rej"></table></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Where applications are lost</h2>
+      <p class="note">Applications that were not booked in the selected month, by LOSS_STAGE and LOSS_REASON.</p>
+      <div class="tablewrap" style="max-height:380px"><table id="t-loss"></table></div>
+    </section>
+  </main>
+</div>
+
+<script>
+/* ============================================================================
+   1. CONFIG — edit to match your data
+   ========================================================================== */
+const CONFIG = {
+  title: 'Application funnel by PD band',
+
+  // Column names in the export (matched case-insensitively)
+  columns: {
+    month: 'APPLICATION_MONTH',
+    channel: 'CHANNEL_TYPE',
+    product: 'PRODUCT_TYPE',
+    stage: 'APPLICATION_STAGE',
+    lossStage: 'LOSS_STAGE',
+    lossReason: 'LOSS_REASON',
+    tracrPD: 'TRACR_PD_PCT',
+    cragPD: 'CRAG_PD_PCT',
+    approved: 'APPROVED_FLAG',
+    booked: 'BOOKED_FLAG',
+    rejected: 'REJECTED_FLAG',
+    rejectionCategory: 'REJECTION_CATEGORY',
+    scoreReject: 'SCORE_REJECT_FLAG',
+    korReject: 'KOR_KYC_OPS_REJECT_FLAG',
+    highOverride: 'HIGH_SIDE_OVERRIDE_FLAG',
+    lowOverride: 'LOW_SIDE_OVERRIDE_FLAG',
+  },
+
+  // Channels and which PD column sets their band. "values" are matched ignoring case, spaces and _ / -.
+  // Applications in any other channel are left out (the page says how many).
+  channels: [
+    { label: 'Instant',   values: ['INSTANT'],              pd: 'tracrPD', pdName: 'TRACR PD' },
+    { label: 'FastTrack', values: ['FASTTRACK', 'FT'],      pd: 'cragPD',  pdName: 'CRAG PD' },
+  ],
+
+  // PD band upper boundaries, in the same units as the PD columns (percent: 0.5 = 0.5%).
+  // A band holds PDs above the previous boundary up to and including this one; the last band is "above".
+  pdBandEdges: [0.5, 1, 2, 3, 5, 7.5, 10, 15, 20, 30],
+  pdDecimals: 2,
+  pdSuffix: '%',
+  noPdLabel: 'No PD',          // applications with a blank PD (e.g. rejected before scoring)
+
+  // Flag values that mean "yes" (anything else, including blank, means "no")
+  trueValues: ['1', 'Y', 'YES', 'TRUE', 'T'],
+
+  // Excel files: worksheet name to read, or null for the first sheet
+  excelSheet: null,
+};
+
+/* ============================================================================
+   2. FILE READING — CSV and Excel (.xlsx); shared with model_monitor.html
+   ========================================================================== */
+
+// Detect the delimiter from the header line (SAS in Europe often writes ';')
+function detectDelimiter(headerLine) {
+  const candidates = [',', ';', '\t', '|'];
+  let best = ',', bestCount = 0;
+  for (const d of candidates) {
+    const c = headerLine.split(d).length - 1;
+    if (c > bestCount) { best = d; bestCount = c; }
+  }
+  return best;
+}
+
+// Split one CSV line, honouring "quoted, values"
+function splitLine(line, delim) {
+  const out = []; let cur = '', inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQ) {
+      if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else inQ = false; }
+      else cur += ch;
+    } else if (ch === '"') inQ = true;
+    else if (ch === delim) { out.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+// Numbers: accepts 0.0734 and 0,0734 (decimal comma); blank or "." (SAS missing) → null
+function parseNumber(s) {
+  s = (s || '').trim();
+  if (s === '' || s === '.') return null;
+  if (s.includes(',') && !s.includes('.')) s = s.replace(',', '.');
+  const v = Number(s);
+  return Number.isFinite(v) ? v : null;
+}
+
+// Periods: normalise common SAS formats to YYYY-MM so they sort correctly
+const MONTHS = { JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06', JUL: '07', AUG: '08', SEP: '09', OCT: '10', NOV: '11', DEC: '12' };
+function normalisePeriod(s) {
+  s = (s || '').trim();
+  let m;
+  if ((m = s.match(/^(\d{4})[-/.](\d{1,2})/))) return m[1] + '-' + m[2].padStart(2, '0');   // 2026-09, 2026-09-30
+  if ((m = s.match(/^(\d{4})(\d{2})$/))) return m[1] + '-' + m[2];                         // 202609
+  if ((m = s.match(/^([A-Za-z]{3})(\d{4})$/)) && MONTHS[m[1].toUpperCase()]) return m[2] + '-' + MONTHS[m[1].toUpperCase()]; // SEP2026
+  if ((m = s.match(/^(\d{1,2})[./](\d{4})$/))) return m[2] + '-' + m[1].padStart(2, '0'); // 09.2026
+  if (/^\d{5}(\.\d+)?$/.test(s)) {                                                         // Excel date cell, e.g. 46265
+    const d = new Date(Date.UTC(1899, 11, 30) + Math.floor(+s) * 86400000);
+    return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0');
+  }
+  return s; // anything else is kept as written and sorted alphabetically
+}
+
+// CSV text → { header: [...], rows: [[...], ...] }
+function parseCSV(text) {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);          // strip BOM
+  const lines = text.split(/\r?\n/).filter((l) => l.trim() !== '');
+  if (lines.length < 2) throw new Error('The file has no data rows.');
+  const delim = detectDelimiter(lines[0]);
+  return { header: splitLine(lines[0], delim), rows: lines.slice(1).map((l) => splitLine(l, delim)) };
+}
+
+/* ----------------------------------------------------------------------------
+   2b. EXCEL READING (.xlsx / .xlsm) — no library needed.
+   An .xlsx file is a zip of XML files; the browser unzips it (DecompressionStream)
+   and we read the first worksheet, or the one named in CONFIG.excelSheet.
+   Old binary .xls files are not supported: save them as .xlsx or CSV.
+   -------------------------------------------------------------------------- */
+async function readXlsx(buffer) {
+  const bytes = new Uint8Array(buffer), dv = new DataView(buffer), utf8 = new TextDecoder();
+
+  // Zip directory: find the "end of central directory" record, then list the entries
+  let eocd = -1;
+  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65557); i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('This does not look like an .xlsx file. Save it as .xlsx or CSV and try again.');
+  const entries = {};
+  let p = dv.getUint32(eocd + 16, true);
+  for (let k = 0, count = dv.getUint16(eocd + 10, true); k < count; k++) {
+    const nameLen = dv.getUint16(p + 28, true), extraLen = dv.getUint16(p + 30, true), commentLen = dv.getUint16(p + 32, true);
+    const name = utf8.decode(bytes.subarray(p + 46, p + 46 + nameLen));
+    entries[name] = { method: dv.getUint16(p + 10, true), size: dv.getUint32(p + 20, true), offset: dv.getUint32(p + 42, true) };
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  const readEntry = async (name) => {
+    const e = entries[name];
+    if (!e) return null;
+    const start = e.offset + 30 + dv.getUint16(e.offset + 26, true) + dv.getUint16(e.offset + 28, true);
+    const data = bytes.subarray(start, start + e.size);
+    if (e.method === 0) return utf8.decode(data);                                   // stored
+    const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return new Response(stream).text();                                             // deflated
+  };
+  const unxml = (s) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n)).replace(/&amp;/g, '&');
+  const textOf = (xml) => unxml([...xml.matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g)].map((m) => m[1]).join(''));
+
+  // Which worksheet file to read
+  const workbook = (await readEntry('xl/workbook.xml')) || '';
+  const rels = (await readEntry('xl/_rels/workbook.xml.rels')) || '';
+  const sheets = [...workbook.matchAll(/<sheet\b[^>]*>/g)].map((m) => ({
+    name: unxml((m[0].match(/\bname="([^"]*)"/) || [])[1] || ''),
+    rid: (m[0].match(/\br:id="([^"]*)"/) || m[0].match(/\bid="([^"]*)"/) || [])[1],
+  }));
+  let sheet = sheets[0];
+  if (CONFIG.excelSheet) {
+    sheet = sheets.find((s) => s.name.toLowerCase() === CONFIG.excelSheet.toLowerCase());
+    if (!sheet) throw new Error(`Sheet "${CONFIG.excelSheet}" not found. The workbook has: ${sheets.map((s) => s.name).join(', ')}.`);
+  }
+  let target = 'worksheets/sheet1.xml';
+  if (sheet && sheet.rid) {
+    const rel = [...rels.matchAll(/<Relationship\b[^>]*>/g)].map((m) => m[0]).find((r) => r.includes(`Id="${sheet.rid}"`));
+    if (rel) target = rel.match(/Target="([^"]*)"/)[1];
+  }
+  const sheetPath = target.startsWith('/') ? target.slice(1) : 'xl/' + target.replace(/^\.\//, '');
+  const sheetXml = await readEntry(sheetPath);
+  if (!sheetXml) throw new Error('Could not find the worksheet inside the Excel file.');
+
+  // Shared strings (text cells point into this list)
+  const sst = await readEntry('xl/sharedStrings.xml');
+  const shared = sst ? [...sst.matchAll(/<si\b[^>]*>([\s\S]*?)<\/si>/g)].map((m) => textOf(m[1])) : [];
+
+  // Cells → rows of text values, placed by their column letter (A, B, …)
+  const colIndex = (letters) => [...letters].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;
+  const rows = [];
+  for (const rowMatch of sheetXml.matchAll(/<row\b[^>]*?(?:\/>|>([\s\S]*?)<\/row>)/g)) {
+    const row = [];
+    let next = 0;
+    for (const c of (rowMatch[1] || '').matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+      const attrs = c[1], body = c[2] || '';
+      const ref = attrs.match(/\br="([A-Z]+)\d+"/);
+      const col = ref ? colIndex(ref[1]) : next;
+      const type = (attrs.match(/\bt="(\w+)"/) || [])[1];
+      const v = (body.match(/<v>([\s\S]*?)<\/v>/) || [])[1];
+      let value = '';
+      if (type === 's') value = shared[+v] ?? '';
+      else if (type === 'inlineStr') value = textOf(body);
+      else if (v != null) value = unxml(v);
+      row[col] = value;
+      next = col + 1;
+    }
+    rows.push(Array.from(row, (x) => x ?? ''));
+  }
+  while (rows.length && rows[0].every((x) => x === '')) rows.shift();          // skip blank top rows
+  if (rows.length < 2) throw new Error('The worksheet has no data rows.');
+  return { header: rows[0], rows: rows.slice(1).filter((r) => r.some((x) => x !== '')) };
+}
+
+/* ============================================================================
+   3. RECORDS — one object per application, with its channel's PD and band
+   ========================================================================== */
+const norm = (s) => String(s ?? '').toUpperCase().replace(/[\s_\-\/]/g, '');
+const isTrue = (s) => CONFIG.trueValues.includes(String(s ?? '').trim().toUpperCase()) || parseNumber(s) === 1;
+
+// Band index for a PD: 0 … edges.length (above last edge); null PD → the "No PD" band (last row)
+function bandOf(pd) {
+  if (pd === null) return CONFIG.pdBandEdges.length + 1;
+  const e = CONFIG.pdBandEdges;
+  let i = 0;
+  while (i < e.length && pd > e[i]) i++;
+  return i;
+}
+function bandLabels() {
+  const e = CONFIG.pdBandEdges, d = CONFIG.pdDecimals, u = CONFIG.pdSuffix;
+  const labels = e.map((hi, i) => (i === 0 ? '≤ ' + hi.toFixed(d) + u : e[i - 1].toFixed(d) + ' – ' + hi.toFixed(d) + u));
+  labels.push('> ' + e[e.length - 1].toFixed(d) + u, CONFIG.noPdLabel);
+  return labels;
+}
+
+function toApplications(table) {
+  const header = table.header.map((h) => norm(h));
+  const idx = {};
+  for (const [key, name] of Object.entries(CONFIG.columns)) idx[key] = header.indexOf(norm(name));
+  const required = ['month', 'channel', 'tracrPD', 'cragPD', 'approved', 'booked', 'scoreReject', 'korReject', 'highOverride', 'lowOverride'];
+  const missing = required.filter((k) => idx[k] < 0);
+  if (missing.length) {
+    throw new Error(`Column(s) not found: ${missing.map((k) => CONFIG.columns[k]).join(', ')}. ` +
+      `The file has: ${table.header.join(', ')}. Change CONFIG.columns at the top of this file to match.`);
+  }
+  const channelOf = new Map();
+  for (const ch of CONFIG.channels) for (const v of ch.values) channelOf.set(norm(v), ch);
+  const get = (row, key) => (idx[key] >= 0 ? row[idx[key]] : '');
+  const text = (row, key) => String(get(row, key) ?? '').trim();
+
+  const apps = [], otherChannels = new Map();
+  for (const row of table.rows) {
+    const rawChannel = text(row, 'channel');
+    const ch = channelOf.get(norm(rawChannel));
+    if (!ch) { otherChannels.set(rawChannel || '(blank)', (otherChannels.get(rawChannel || '(blank)') || 0) + 1); continue; }
+    const pd = parseNumber(get(row, ch.pd));
+    apps.push({
+      month: normalisePeriod(text(row, 'month')),
+      channel: ch.label,
+      product: text(row, 'product') || '(blank)',
+      pd,
+      band: bandOf(pd),
+      kor: isTrue(get(row, 'korReject')) ? 1 : 0,
+      score: isTrue(get(row, 'scoreReject')) ? 1 : 0,
+      hso: isTrue(get(row, 'highOverride')) ? 1 : 0,
+      lso: isTrue(get(row, 'lowOverride')) ? 1 : 0,
+      approved: isTrue(get(row, 'approved')) ? 1 : 0,
+      booked: isTrue(get(row, 'booked')) ? 1 : 0,
+      rejected: isTrue(get(row, 'rejected')) ? 1 : 0,
+      rejCat: text(row, 'rejectionCategory'),
+      stage: text(row, 'stage'),
+      lossStage: text(row, 'lossStage'),
+      lossReason: text(row, 'lossReason'),
+    });
+  }
+  if (!apps.length) throw new Error('No applications in the channels set in CONFIG.channels. Channels found: ' + [...otherChannels.keys()].join(', '));
+  return { apps, otherChannels };
+}
+
+/* ============================================================================
+   4. CALCULATIONS
+   ========================================================================== */
+const ratio = (num, den) => (den ? num / den : null);
+
+// Totals for a group of applications
+function totals(apps) {
+  const t = { a: apps.length, kor: 0, score: 0, hso: 0, lso: 0, approved: 0, booked: 0 };
+  for (const x of apps) { t.kor += x.kor; t.score += x.score; t.hso += x.hso; t.lso += x.lso; t.approved += x.approved; t.booked += x.booked; }
+  return {
+    ...t,
+    korPct: ratio(t.kor, t.a), scorePct: ratio(t.score, t.a), hsoPct: ratio(t.hso, t.a), lsoPct: ratio(t.lso, t.a),
+    approvedPct: ratio(t.approved, t.a),
+    bookedPct: ratio(t.booked, t.approved),   // booked ÷ approved, as in the Excel ("disbursed / approved")
+  };
+}
+
+// The PD-band table: one row per band (always all bands, so months line up) plus a total row
+function bandTable(apps) {
+  const labels = bandLabels();
+  const groups = labels.map(() => []);
+  for (const x of apps) groups[x.band].push(x);
+  const rows = groups.map((g, i) => ({ band: labels[i], ...totals(g) }));
+  const total = { band: 'Total', ...totals(apps) };
+  for (const r of rows) r.appPct = ratio(r.a, total.a);
+  total.appPct = total.a ? 1 : null;
+  return { rows, total };
+}
+
+// Mutually exclusive outcome for the "Outcome by PD band" chart
+function outcomeOf(x) {
+  if (x.approved) return x.booked ? 'booked' : 'approved';
+  if (x.kor) return 'kor';
+  if (x.score) return 'score';
+  if (x.rejected) return 'otherrej';
+  return 'other';
+}
+
+// Count by one or two text fields, largest first
+function countBy(apps, keyFn) {
+  const m = new Map();
+  for (const x of apps) { const k = keyFn(x); m.set(k, (m.get(k) || 0) + 1); }
+  return [...m.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+/* ============================================================================
+   5. CHARTS — SVG helper (shared with model_monitor.html)
+   ========================================================================== */
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function niceTicks(lo, hi, count) {
+  const span = hi - lo || Math.abs(hi) || 1;
+  const raw = span / count, mag = Math.pow(10, Math.floor(Math.log10(raw))), r = raw / mag;
+  const step = (r >= 7.5 ? 10 : r >= 3.5 ? 5 : r >= 1.5 ? 2 : 1) * mag;
+  const ticks = [];
+  for (let v = Math.floor(lo / step) * step; v <= Math.ceil(hi / step) * step + step / 2; v += step) ticks.push(+v.toFixed(10));
+  return ticks;
+}
+const _ctx = document.createElement('canvas').getContext('2d');
+function textWidth(t) { _ctx.font = '11px ' + getComputedStyle(document.body).fontFamily; return _ctx.measureText(t).width; }
+
+/*
+  drawChart(element, {
+    labels:  ['2026-01', ...]            x-axis categories
+    series:  [{ name, values, type: 'bar' | 'line', color, colorOf: (value, i) => cssColor }]
+    refs:    [{ value, label }]          dashed horizontal reference lines
+    refLabelsLeft: true                  put reference-line labels on the left instead of the right
+    yFormat: (v) => string
+    zeroBased: true                      start the y-axis at 0 (bars)
+    highlight: index                     emphasise one category (the selected period)
+    onClick: (index) => {}               click on a category
+  })
+*/
+function drawChart(el, o) {
+  el.innerHTML = '';
+  const W = Math.max(280, el.clientWidth), H = o.height || 240, mt = 12, mb = 26, mr = 10;
+  const vals = [];
+  o.series.forEach((s) => s.values.forEach((v) => { if (v != null && Number.isFinite(v)) vals.push(v); }));
+  (o.refs || []).forEach((r) => vals.push(r.value));
+  if (!vals.length) { el.innerHTML = '<div class="empty-chart">' + esc(o.emptyText || 'No values to show') + '</div>'; return; }
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  if (o.zeroBased) lo = Math.min(0, lo);
+  else { const pad = (hi - lo || Math.abs(hi) * 0.1 || 0.1) * 0.25; lo -= pad; hi += pad; }
+  if (o.clamp) { lo = Math.max(o.clamp[0], lo); hi = Math.min(o.clamp[1], hi); }
+  const ticks = niceTicks(lo, hi, 4); lo = ticks[0]; hi = ticks[ticks.length - 1];
+  const fmt = o.yFormat || ((v) => String(v));
+  const ml = Math.ceil(Math.max(...ticks.map((t) => textWidth(fmt(t))))) + 12;
+  const n = o.labels.length, step = (W - ml - mr) / n;
+  const cx = (i) => ml + step * (i + 0.5);
+  const y = (v) => mt + (H - mt - mb) * (1 - (v - lo) / (hi - lo || 1));
+  let s = `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" role="img">`;
+
+  // grid + y labels
+  for (const t of ticks) {
+    s += `<line x1="${ml}" x2="${W - mr}" y1="${y(t)}" y2="${y(t)}" style="stroke:var(--grid)"/>`;
+    s += `<text x="${ml - 8}" y="${y(t)}" dy="0.32em" text-anchor="end">${esc(fmt(t))}</text>`;
+  }
+  // bars (grouped when there are several bar series)
+  const barSeries = o.series.filter((x) => x.type === 'bar');
+  const groupW = Math.min(step * 0.72, 30 * barSeries.length), bw = groupW / Math.max(1, barSeries.length);
+  barSeries.forEach((ser, k) => ser.values.forEach((v, i) => {
+    if (v == null || !Number.isFinite(v)) return;
+    const x = cx(i) - groupW / 2 + k * bw, y0 = y(Math.max(lo, 0)), y1 = y(v);
+    const color = ser.colorOf ? ser.colorOf(v, i) : ser.color;
+    const op = o.highlight != null && barSeries.length === 1 && i !== o.highlight ? 0.55 : 1;
+    s += `<rect x="${x + 1}" y="${Math.min(y0, y1)}" width="${Math.max(1, bw - 2)}" height="${Math.max(1, Math.abs(y0 - y1))}" rx="3" style="fill:${color};opacity:${op}"/>`;
+  }));
+  // reference lines
+  for (const r of o.refs || []) {
+    s += `<line x1="${ml}" x2="${W - mr}" y1="${y(r.value)}" y2="${y(r.value)}" style="stroke:var(--muted)" stroke-dasharray="5 4"/>`;
+    if (r.label) s += o.refLabelsLeft
+      ? `<text x="${ml + 4}" y="${y(r.value) - 5}" text-anchor="start">${esc(r.label)}</text>`
+      : `<text x="${W - mr}" y="${y(r.value) - 5}" text-anchor="end">${esc(r.label)}</text>`;
+  }
+  // lines (gaps where a value is missing)
+  for (const ser of o.series.filter((x) => x.type === 'line')) {
+    let d = '', pen = false;
+    ser.values.forEach((v, i) => {
+      if (v == null || !Number.isFinite(v)) { pen = false; return; }
+      d += (pen ? 'L' : 'M') + cx(i) + ',' + y(v); pen = true;
+    });
+    s += `<path d="${d}" fill="none" style="stroke:${ser.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    ser.values.forEach((v, i) => {
+      if (v == null || !Number.isFinite(v)) return;
+      const big = i === o.highlight;
+      s += `<circle cx="${cx(i)}" cy="${y(v)}" r="${big ? 5 : 3}" style="fill:${ser.color};stroke:var(--panel)" stroke-width="${big ? 2 : 1}"/>`;
+    });
+  }
+  // x labels (thinned when crowded; the last one always shows)
+  const every = Math.max(1, Math.ceil(Math.max(...o.labels.map((l) => textWidth(l))) / step + 0.3));
+  o.labels.forEach((l, i) => {
+    if ((n - 1 - i) % every !== 0) return;
+    s += `<text x="${cx(i)}" y="${H - 8}" text-anchor="middle" style="${i === o.highlight ? 'fill:var(--fg);font-weight:600' : ''}">${esc(l)}</text>`;
+  });
+  // invisible hover/click targets
+  o.labels.forEach((_, i) => {
+    s += `<rect data-i="${i}" x="${ml + step * i}" y="${mt}" width="${step}" height="${H - mt - mb}" fill="transparent" style="cursor:${o.onClick ? 'pointer' : 'default'}"/>`;
+  });
+  s += '</svg>';
+  el.innerHTML = s + '<div class="tip"></div>';
+
+  const tip = el.querySelector('.tip'), svg = el.querySelector('svg');
+  svg.addEventListener('mousemove', (ev) => {
+    const i = ev.target.dataset && ev.target.dataset.i;
+    if (i == null) { tip.style.display = 'none'; return; }
+    const idx = +i;
+    let html = `<div class="h">${esc(o.labels[idx])}</div>`;
+    for (const ser of o.series) {
+      const v = ser.values[idx];
+      html += `<div class="r"><span>${esc(ser.name)}</span><b>${v == null ? '—' : esc((ser.format || fmt)(v))}</b></div>`;
+    }
+    if (o.tooltipExtra) for (const [k, v] of o.tooltipExtra(idx)) html += `<div class="r"><span>${esc(k)}</span><b>${esc(v)}</b></div>`;
+    tip.innerHTML = html; tip.style.display = 'block';
+    const left = Math.max(0, Math.min(el.clientWidth - tip.offsetWidth, cx(idx) * el.clientWidth / W - tip.offsetWidth / 2));
+    tip.style.left = left + 'px'; tip.style.top = Math.max(0, ev.offsetY - tip.offsetHeight - 12) + 'px';
+  });
+  svg.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+  if (o.onClick) svg.addEventListener('click', (ev) => { const i = ev.target.dataset && ev.target.dataset.i; if (i != null) o.onClick(+i); });
+}
+
+/* ============================================================================
+   6. PAGE RENDERING
+   ========================================================================== */
+const $ = (id) => document.getElementById(id);
+const pct = (v, d = 2) => (v == null ? '—' : (v * 100).toFixed(d) + '%');
+const int = (v) => (v == null ? '—' : v.toLocaleString('en'));
+function formatPeriod(p) {
+  const m = /^(\d{4})-(\d{2})$/.exec(p);
+  return m ? new Date(Date.UTC(+m[1], +m[2] - 1, 1)).toLocaleString('en', { month: 'short', year: 'numeric', timeZone: 'UTC' }) : p;
+}
+// Change vs prior month: relative for counts, percentage points for rates
+function deltaHtml(cur, prev, kind, goodWhenUp) {
+  if (cur == null || prev == null) return '<span class="flat">no prior month</span>';
+  const d = kind === 'count' ? (prev ? cur / prev - 1 : null) : (cur - prev) * 100;
+  if (d == null) return '<span class="flat">no prior month</span>';
+  const txt = kind === 'count' ? (d >= 0 ? '+' : '−') + Math.abs(d * 100).toFixed(1) + '%' : (d >= 0 ? '+' : '−') + Math.abs(d).toFixed(2) + ' pts';
+  const cls = Math.abs(d) < 1e-9 || goodWhenUp == null ? 'flat' : (d > 0) === goodWhenUp ? 'up' : 'down';
+  return `<span class="${cls}">${txt}</span> vs prior month`;
+}
+
+let DATA = null;            // { apps, months, products }
+const SEL = { month: null, channel: 'All', product: 'All' };
+
+function filtered(month) {
+  return DATA.apps.filter((x) => (month == null || x.month === month)
+    && (SEL.channel === 'All' || x.channel === SEL.channel)
+    && (SEL.product === 'All' || x.product === SEL.product));
+}
+
+function render() {
+  if (!DATA) return;
+  const months = DATA.months, mi = months.indexOf(SEL.month);
+  const cur = filtered(SEL.month), prev = mi > 0 ? filtered(months[mi - 1]) : null;
+  const T = totals(cur), P = prev ? totals(prev) : null;
+  const scope = [formatPeriod(SEL.month), SEL.channel === 'All' ? 'All channels' : SEL.channel, SEL.product === 'All' ? 'All products' : SEL.product].join(' · ');
+
+  // Banner
+  $('banner').innerHTML = T.a
+    ? `<b>${esc(scope)}:</b> ${int(T.a)} applications; ${pct(T.korPct)} rejected by KOR and ${pct(T.scorePct)} by score; ${pct(T.approvedPct)} approved, of which ${pct(T.bookedPct)} booked.`
+    : `<b>${esc(scope)}:</b> no applications.`;
+
+  // KPI cards
+  $('k-month').textContent = scope;
+  $('k-apps').textContent = int(T.a);       $('k-apps-d').innerHTML = deltaHtml(T.a, P && P.a, 'count', null);
+  $('k-kor').textContent = pct(T.korPct);   $('k-kor-d').innerHTML = deltaHtml(T.korPct, P && P.korPct, 'rate', false);
+  $('k-score').textContent = pct(T.scorePct); $('k-score-d').innerHTML = deltaHtml(T.scorePct, P && P.scorePct, 'rate', false);
+  $('k-appr').textContent = pct(T.approvedPct); $('k-appr-d').innerHTML = deltaHtml(T.approvedPct, P && P.approvedPct, 'rate', true);
+  $('k-book').textContent = pct(T.bookedPct); $('k-book-d').innerHTML = deltaHtml(T.bookedPct, P && P.bookedPct, 'rate', true);
+  $('k-ovr').textContent = pct(T.a ? (T.hso + T.lso) / T.a : null);
+  $('k-ovr-d').textContent = `High side ${pct(T.hsoPct)} · low side ${pct(T.lsoPct)}`;
+
+  // Band table (same layout as the Excel report)
+  const { rows, total } = bandTable(cur);
+  const pdName = SEL.channel === 'All' ? CONFIG.channels.map((c) => `${c.pdName} (${c.label})`).join(' / ')
+    : CONFIG.channels.find((c) => c.label === SEL.channel).pdName;
+  $('table-title').textContent = formatPeriod(SEL.month);
+  $('table-note').textContent = `${SEL.channel === 'All' ? 'All channels' : SEL.channel} · ${SEL.product === 'All' ? 'All products' : SEL.product}. PD band from ${pdName}.`;
+  const cell = (v, isPct) => {
+    const txt = isPct ? pct(v) : int(v);
+    return `<td class="${v === 0 ? 'zero' : ''}">${txt}</td>`;
+  };
+  let h = `<tr><th>PD band</th><th>Application #<small>a</small></th><th>Application %<small>a / Sum(a)</small></th>
+    <th>Rejects % by KOR<small>KOR rejects / a</small></th><th>Rejects % by Score<small>score rejects / a</small></th>
+    <th>High Side Overrides %<small>overrides / a</small></th><th>Low Side Overrides %<small>overrides / a</small></th>
+    <th>Approved %<small>approved / a</small></th><th>Booked %<small>booked / approved</small></th></tr>`;
+  for (const r of [...rows, total]) {
+    h += `<tr class="${r === total ? 'total' : ''}"><td>${esc(r.band)}</td>${cell(r.a)}${cell(r.appPct, true)}${cell(r.korPct, true)}${cell(r.scorePct, true)}` +
+      `${cell(r.hsoPct, true)}${cell(r.lsoPct, true)}${cell(r.approvedPct, true)}${cell(r.bookedPct, true)}</tr>`;
+  }
+  $('t-bands').innerHTML = h;
+
+  // Outcome mix by band
+  const labels = bandLabels(), order = ['booked', 'approved', 'kor', 'score', 'otherrej', 'other'];
+  const names = { booked: 'Booked', approved: 'Approved, not booked', kor: 'KOR reject', score: 'Score reject', otherrej: 'Other reject', other: 'Withdrawn / pending' };
+  const byBand = labels.map(() => Object.fromEntries(order.map((k) => [k, 0])));
+  for (const x of cur) byBand[x.band][outcomeOf(x)]++;
+  $('c-mix').innerHTML = labels.map((l, i) => {
+    const n = rows[i].a;
+    const segs = n ? order.map((k) => byBand[i][k] ? `<span title="${esc(names[k])}: ${byBand[i][k]} (${pct(byBand[i][k] / n, 1)})" style="width:${(byBand[i][k] / n) * 100}%;background:var(--c-${k})"></span>` : '').join('') : '';
+    return `<div class="mix-row"><span>${esc(l)}</span><div class="mix-bar">${segs}</div><span class="mix-n">${int(n)}</span></div>`;
+  }).join('');
+
+  // Monthly trend (current channel/product filters, all months)
+  const trend = months.map((m) => totals(filtered(m)));
+  const mLabels = months.map(formatPeriod);
+  const pick = (i) => { SEL.month = months[i]; $('f-month').value = SEL.month; render(); };
+  drawChart($('c-apps'), {
+    labels: mLabels, highlight: mi, onClick: pick, zeroBased: true, yFormat: (v) => int(v),
+    series: [{ name: 'Applications', type: 'bar', values: trend.map((t) => t.a), color: 'var(--accent)' }],
+  });
+  drawChart($('c-rates'), {
+    labels: mLabels, highlight: mi, onClick: pick, zeroBased: true, yFormat: (v) => (v * 100).toFixed(0) + '%',
+    series: [
+      { name: 'Approved %', type: 'line', values: trend.map((t) => t.approvedPct), color: 'var(--l1)', format: (v) => pct(v) },
+      { name: 'KOR rejects %', type: 'line', values: trend.map((t) => t.korPct), color: 'var(--l2)', format: (v) => pct(v) },
+      { name: 'Score rejects %', type: 'line', values: trend.map((t) => t.scorePct), color: 'var(--l3)', format: (v) => pct(v) },
+      { name: 'Booked %', type: 'line', values: trend.map((t) => t.bookedPct), color: 'var(--l4)', format: (v) => pct(v) },
+    ],
+  });
+
+  // Rejection categories
+  const rejected = cur.filter((x) => x.rejected || x.kor || x.score);
+  const rc = countBy(rejected, (x) => x.rejCat || '(blank)');
+  $('t-rej').innerHTML = '<tr><th>Category</th><th>Rejected</th><th>% of rejected</th><th>% of applications</th></tr>' +
+    (rc.length ? rc.map(([k, n]) => `<tr><td>${esc(k)}</td><td>${int(n)}</td><td>${pct(n / rejected.length, 1)}</td><td>${pct(n / cur.length, 1)}</td></tr>`).join('')
+      : '<tr><td colspan="4" class="zero">No rejected applications</td></tr>');
+
+  // Losses
+  const lost = cur.filter((x) => !x.booked);
+  const lc = countBy(lost, (x) => (x.lossStage || '(blank)') + '\u0000' + (x.lossReason || '(blank)'));
+  $('t-loss').innerHTML = '<tr><th>Loss stage</th><th style="text-align:left">Loss reason</th><th>Applications</th><th>% of not booked</th><th class="hide-narrow">% of applications</th></tr>' +
+    (lc.length ? lc.map(([k, n]) => { const [s, r] = k.split('\u0000'); return `<tr><td>${esc(s)}</td><td style="text-align:left">${esc(r)}</td><td>${int(n)}</td><td>${pct(n / lost.length, 1)}</td><td class="hide-narrow">${pct(n / cur.length, 1)}</td></tr>`; }).join('')
+      : '<tr><td colspan="5" class="zero">Every application was booked</td></tr>');
+}
+
+function showData(result, sourceName) {
+  const { apps, otherChannels } = result;
+  const months = [...new Set(apps.map((x) => x.month))].sort();
+  const products = [...new Set(apps.map((x) => x.product))].sort();
+  DATA = { apps, months, products };
+  SEL.month = months[months.length - 1]; SEL.channel = 'All'; SEL.product = 'All';
+  $('f-month').innerHTML = months.map((m) => `<option value="${esc(m)}">${esc(formatPeriod(m))}</option>`).join('');
+  $('f-month').value = SEL.month;
+  $('f-channel').innerHTML = '<option value="All">All channels</option>' + CONFIG.channels.map((c) => `<option>${esc(c.label)}</option>`).join('');
+  $('f-product').innerHTML = '<option value="All">All products</option>' + products.map((p) => `<option>${esc(p)}</option>`).join('');
+  const notes = [];
+  if (otherChannels.size) {
+    const list = [...otherChannels.entries()].map(([k, n]) => `${k} (${int(n)})`).join(', ');
+    notes.push(`Left out, channel not in CONFIG.channels: ${list}. Add the channel and its PD column there to include it.`);
+  }
+  $('message').innerHTML = notes.map((n) => `<div class="banner warn">${esc(n)}</div>`).join('');
+  $('fileinfo').textContent = `${sourceName} · ${int(apps.length)} applications · ${months.length} months`;
+  $('filters').hidden = false; $('welcome').hidden = true; $('dashboard').hidden = false;
+  render();
+}
+
+function showError(err) {
+  $('message').innerHTML = `<div class="banner bad"><span class="error">Could not read the file.</span> ${esc(err.message || err)}</div>`;
+}
+
+// CSV of the band table for every month, with the current channel and product filters
+function downloadTable() {
+  const cols = ['month', 'channel', 'product', 'pd_band', 'applications', 'application_pct', 'rejects_pct_kor', 'rejects_pct_score',
+    'high_side_overrides_pct', 'low_side_overrides_pct', 'approved_pct', 'booked_pct'];
+  const out = [cols.join(',')];
+  const f = (v) => (v == null ? '' : (v * 100).toFixed(4));
+  const q = (s) => '"' + String(s).replace(/"/g, '""') + '"';
+  for (const m of DATA.months) {
+    const { rows, total } = bandTable(filtered(m));
+    for (const r of [...rows, total]) {
+      out.push([m, q(SEL.channel), q(SEL.product), q(r.band), r.a, f(r.appPct), f(r.korPct), f(r.scorePct), f(r.hsoPct), f(r.lsoPct), f(r.approvedPct), f(r.bookedPct)].join(','));
+    }
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['﻿' + out.join('\n')], { type: 'text/csv' }));
+  a.download = 'pd_band_table.csv';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+/* ============================================================================
+   7. STARTUP
+   ========================================================================== */
+document.title = CONFIG.title; $('title').textContent = CONFIG.title;
+
+async function loadFile(file) {
+  if (!file) return;
+  const ext = (file.name.match(/\.([^.]+)$/) || [])[1]?.toLowerCase() || '';
+  const previous = $('fileinfo').textContent;
+  $('fileinfo').textContent = 'Reading ' + file.name + '…';
+  try {
+    if (ext === 'sas7bdat') throw new Error('SAS datasets (.sas7bdat) can’t be read in a browser. In SAS, export the data as CSV or Excel (see applications_export.sas) and load that file.');
+    if (ext === 'xls') throw new Error('Old-style .xls files aren’t supported. Save the file as .xlsx or CSV and load it again.');
+    const table = ext === 'xlsx' || ext === 'xlsm' ? await readXlsx(await file.arrayBuffer()) : parseCSV(await file.text());
+    showData(toApplications(table), file.name);
+  } catch (e) {
+    showError(e);
+    $('fileinfo').textContent = previous;
+  }
+}
+$('file').addEventListener('change', (e) => { loadFile(e.target.files[0]); e.target.value = ''; });
+$('f-month').addEventListener('change', (e) => { SEL.month = e.target.value; render(); });
+$('f-channel').addEventListener('change', (e) => { SEL.channel = e.target.value; render(); });
+$('f-product').addEventListener('change', (e) => { SEL.product = e.target.value; render(); });
+$('download').addEventListener('click', downloadTable);
+document.addEventListener('dragover', (e) => { e.preventDefault(); document.body.classList.add('dragging'); });
+document.addEventListener('dragleave', (e) => { if (!e.relatedTarget) document.body.classList.remove('dragging'); });
+document.addEventListener('drop', (e) => { e.preventDefault(); document.body.classList.remove('dragging'); loadFile(e.dataTransfer.files[0]); });
+let _rt; window.addEventListener('resize', () => { clearTimeout(_rt); _rt = setTimeout(render, 150); });
+</script>
+</body>
+</html>
